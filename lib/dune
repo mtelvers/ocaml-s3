@@ -1,0 +1,5 @@
+(library
+ (name s3)
+ (public_name s3)
+ (libraries eio cohttp-eio cohttp http uri digestif xmlm fmt logs unix
+   tls-eio ca-certs x509 domain-name ptime mirage-crypto-rng.unix))

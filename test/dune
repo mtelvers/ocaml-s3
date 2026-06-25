@@ -1,0 +1,11 @@
+; Offline unit tests; run under `dune runtest`.
+(test
+ (name test_unit)
+ (libraries s3 alcotest))
+
+; Integration tests against a live server; built here but launched manually
+; (see the header of test_integration.ml). Not wired into @runtest because it
+; needs network access and credentials.
+(executable
+ (name test_integration)
+ (libraries s3 alcotest eio eio_main digestif unix))

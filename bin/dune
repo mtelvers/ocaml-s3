@@ -1,0 +1,4 @@
+(executable
+ (name s3cli)
+ (public_name s3cli)
+ (libraries s3 cmdliner eio eio_main fmt))
