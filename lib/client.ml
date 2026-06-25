@@ -21,10 +21,20 @@ let make_config ?(region = "us-east-1") ?(path_style = true)
 type conn = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
 
 (* A pool of keep-alive connections to one endpoint. cohttp-eio has no built-in
-   connection cache, but its [make_generic] lets us supply the socket for a
-   request; we hand out pooled sockets and recycle them once the response body
-   has been consumed. The semaphore bounds the number of live connections;
-   [idle] holds ready-to-reuse ones.
+   connection cache (its client is just [sw -> uri -> connection]) and does no
+   liveness checking, so reuse, staleness and timeouts are all ours to manage.
+   [make_generic] lets us supply the socket for a request; we hand out pooled
+   sockets and recycle them once the response body has been consumed. The
+   semaphore bounds the number of live connections; [idle] holds ready-to-reuse
+   ones, each stamped with the time it was released.
+
+   Staleness: S3 endpoints (and the load balancers in front of them) routinely
+   close idle keep-alive connections. A pooled connection the server has closed
+   sits in [CLOSE_WAIT]; writing the next request to it blocks on TCP
+   back-pressure forever (no error, no timeout) — a hang. So [acquire] discards
+   any idle connection that has sat unused longer than [idle_ttl] and dials a
+   fresh one instead. The per-request timeout in [call] is the backstop for the
+   race where a connection dies inside that window.
 
    The target [addr]/[domain] are mutable so the pool can be re-pointed at a
    different host when the server issues a region redirect; [dial] opens a fresh
@@ -32,16 +42,20 @@ type conn = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
 module Conn_pool = struct
   type t = {
     dial : Eio.Net.Sockaddr.stream -> [ `host ] Domain_name.t option -> conn;
+    now : unit -> float;
+    idle_ttl : float;
     mutable addr : Eio.Net.Sockaddr.stream;
     mutable domain : [ `host ] Domain_name.t option;
-    mutable idle : conn list;
+    mutable idle : (conn * float) list;  (* connection + time it was released *)
     mutex : Eio.Mutex.t;
     sem : Eio.Semaphore.t;
   }
 
-  let create ~addr ~domain ~dial ~max =
+  let create ~addr ~domain ~dial ~max ~now ~idle_ttl =
     {
       dial;
+      now;
+      idle_ttl;
       addr;
       domain;
       idle = [];
@@ -49,28 +63,42 @@ module Conn_pool = struct
       sem = Eio.Semaphore.make max;
     }
 
-  (* Acquire a connection, reusing an idle one if available. Returns the
-     connection and whether it was freshly opened (vs. reused). *)
-  let acquire t : conn * bool =
-    Eio.Semaphore.acquire t.sem;
+  (* Pop the most-recently-released idle connection that is still within the
+     idle TTL, closing any that have been idle too long. Idle connections hold
+     no semaphore permit, so a discarded one is simply closed. *)
+  let rec take_fresh_idle t =
     match
       Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
           match t.idle with
-          | c :: rest ->
+          | entry :: rest ->
               t.idle <- rest;
-              Some c
+              Some entry
           | [] -> None)
     with
+    | None -> None
+    | Some (c, released) ->
+        if t.now () -. released > t.idle_ttl then begin
+          (try Eio.Resource.close c with _ -> ());
+          take_fresh_idle t
+        end
+        else Some c
+
+  (* Acquire a connection, reusing a fresh-enough idle one if available.
+     Returns the connection and whether it was freshly opened (vs. reused). *)
+  let acquire t : conn * bool =
+    Eio.Semaphore.acquire t.sem;
+    match take_fresh_idle t with
     | Some c -> (c, false)
     | None -> (
-        (* No idle connection; open a new one (still holding a permit). *)
+        (* No fresh idle connection; open a new one (still holding a permit). *)
         try (t.dial t.addr t.domain, true)
         with e ->
           Eio.Semaphore.release t.sem;
           raise e)
 
   let release t (c : conn) =
-    Eio.Mutex.use_rw ~protect:true t.mutex (fun () -> t.idle <- c :: t.idle);
+    Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
+        t.idle <- (c, t.now ()) :: t.idle);
     Eio.Semaphore.release t.sem
 
   let discard t (c : conn) =
@@ -82,16 +110,21 @@ module Conn_pool = struct
      they reach a server that redirects them. *)
   let retarget t ~addr ~domain =
     Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
-        List.iter (fun c -> try Eio.Resource.close c with _ -> ()) t.idle;
+        List.iter (fun (c, _) -> try Eio.Resource.close c with _ -> ()) t.idle;
         t.idle <- [];
         t.addr <- addr;
         t.domain <- domain)
 end
 
+(* Existential wrapper so the polymorphic Eio clock can live in the record;
+   unpacked where [Eio.Time.with_timeout_exn] needs it. *)
+type any_clock = Clock : _ Eio.Time.clock -> any_clock
+
 type t = {
   config : config;
   pool : Conn_pool.t;
   now : unit -> float;
+  clock : any_clock;  (* for per-request timeouts *)
   scheme : string;
   port_suffix : string;  (* ":port" or "" *)
   resolve : string -> Eio.Net.Sockaddr.stream;  (* host -> address *)
@@ -167,6 +200,19 @@ let make_tls_config ~now ~tls_verification =
 let domain_of_host host =
   try Some (Domain_name.host_exn (Domain_name.of_string_exn host)) with _ -> None
 
+(* Pooled connections idle longer than this are assumed possibly closed by the
+   server / a load balancer and are discarded rather than reused (S3 LBs
+   routinely drop idle keep-alives). Short enough to retire sporadic
+   connections, long enough to reuse within a multipart burst. *)
+let idle_connection_ttl = 10.0
+
+(* Per-request-attempt timeout. A request wedged on a half-closed connection
+   (write blocked on TCP back-pressure to a peer that has gone away) would
+   otherwise hang forever — cohttp-eio has no timeout. On expiry the attempt is
+   treated like any other failure: the connection is discarded and, if it was a
+   reused one, the request is retried on a fresh connection. *)
+let request_attempt_timeout = 120.0
+
 let create ~sw ~net ~clock config =
   let uri = Uri.of_string config.endpoint in
   let scheme = Option.value ~default:"http" (Uri.scheme uri) in
@@ -198,12 +244,13 @@ let create ~sw ~net ~clock config =
   in
   let pool =
     Conn_pool.create ~addr:(resolve host) ~domain:(domain_of_host host) ~dial
-      ~max:config.max_connections
+      ~max:config.max_connections ~now ~idle_ttl:idle_connection_ttl
   in
   {
     config;
     pool;
     now;
+    clock = Clock clock;
     scheme;
     port_suffix;
     resolve;
@@ -354,27 +401,33 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     in
     let uri = Uri.of_string (base t ^ target) in
     Log.debug (fun m -> m "%a %s" Http.Method.pp meth target);
+    let (Clock clk) = t.clock in
     let attempt () =
       let conn, fresh = Conn_pool.acquire t.pool in
       (* cohttp-eio drives the HTTP over the connection we hand it; it never
          closes the socket, so we own its lifecycle. *)
       let client = Cohttp_eio.Client.make_generic (fun ~sw:_ _uri -> conn) in
       match
-        Eio.Switch.run (fun sw ->
-            let resp, rbody =
-              Cohttp_eio.Client.call client ~sw ~headers
-                ~body:(Cohttp_eio.Body.of_string body) meth uri
-            in
-            match (if follow > 0 then redirect_region t resp else None) with
-            | Some new_region ->
-                (* Drain the (small) redirect body so the connection stays
-                   reusable, then signal a redirect rather than calling [f]. *)
-                let _ : string =
-                  Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536
-                    rbody
+        (* Per-attempt timeout: a write wedged on a half-closed pooled
+           connection raises nothing and never returns, so cap it here. On
+           expiry the [exception] arm discards the connection and (for a reused
+           one) retries on a fresh connection. *)
+        Eio.Time.with_timeout_exn clk request_attempt_timeout (fun () ->
+            Eio.Switch.run (fun sw ->
+                let resp, rbody =
+                  Cohttp_eio.Client.call client ~sw ~headers
+                    ~body:(Cohttp_eio.Body.of_string body) meth uri
                 in
-                `Redirect (resp, new_region)
-            | None -> `Done (resp, f resp rbody))
+                match (if follow > 0 then redirect_region t resp else None) with
+                | Some new_region ->
+                    (* Drain the (small) redirect body so the connection stays
+                       reusable, then signal a redirect rather than calling [f]. *)
+                    let _ : string =
+                      Eio.Buf_read.parse_exn Eio.Buf_read.take_all
+                        ~max_size:65536 rbody
+                    in
+                    `Redirect (resp, new_region)
+                | None -> `Done (resp, f resp rbody)))
       with
       | `Done (resp, result) ->
           if connection_should_close resp then Conn_pool.discard t.pool conn
@@ -384,6 +437,11 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
           if connection_should_close resp then Conn_pool.discard t.pool conn
           else Conn_pool.release t.pool conn;
           `Follow new_region
+      | exception (Eio.Cancel.Cancelled _ as e) ->
+          (* External cancellation (caller's switch failing) must propagate,
+             not be turned into a retry. *)
+          Conn_pool.discard t.pool conn;
+          raise e
       | exception e ->
           Conn_pool.discard t.pool conn;
           if fresh then raise e else `Retry_conn
