@@ -74,11 +74,22 @@ type t
 val create :
   sw:Eio.Switch.t -> net:_ Eio.Net.t -> clock:_ Eio.Time.clock -> config -> t
 
-(** A structured S3 error, decoded from the server's XML error document where
-    available. *)
+(** A structured error. For an HTTP-level failure it is decoded from the
+    server's XML error document where available. Failures where no HTTP response
+    was received — a transport error (timeout, connection/TLS), or a client-side
+    precondition (e.g. an upload exceeding the part limit) — are reported the
+    same way, with [http_status = 0].
+
+    Operations return all failures — including transport ones — as [Error]; the
+    client does not raise for network errors. (Caller-initiated cancellation via
+    a failing {!Eio.Switch.t} still propagates as an exception, as usual.) *)
 type error = {
-  http_status : int;  (** HTTP status code. *)
-  code : string;  (** S3 error code, e.g. ["NoSuchKey"], or [""] if unknown. *)
+  http_status : int;
+      (** HTTP status code, or [0] when no HTTP response was received. *)
+  code : string;
+      (** S3 error code, e.g. ["NoSuchKey"]; ["Timeout"]/["Transport"] for a
+          transport failure; ["TooManyParts"] for the part-limit precondition;
+          or [""] if unknown. *)
   message : string;  (** Human-readable message. *)
 }
 

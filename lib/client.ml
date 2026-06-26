@@ -42,22 +42,23 @@ type conn = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
    connection (TCP, plus a TLS handshake for https) to the current target. *)
 module Conn_pool = struct
   type t = {
-    dial : Eio.Net.Sockaddr.stream -> [ `host ] Domain_name.t option -> conn;
+    dial : string -> [ `host ] Domain_name.t option -> conn;
+        (* [dial host domain] resolves [host] and opens a connection to it. *)
     now : unit -> float;
     idle_ttl : float;
-    mutable addr : Eio.Net.Sockaddr.stream;
+    mutable host : string;
     mutable domain : [ `host ] Domain_name.t option;
     mutable idle : (conn * float) list;  (* connection + time it was released *)
     mutex : Eio.Mutex.t;
     sem : Eio.Semaphore.t;
   }
 
-  let create ~addr ~domain ~dial ~max ~now ~idle_ttl =
+  let create ~host ~domain ~dial ~max ~now ~idle_ttl =
     {
       dial;
       now;
       idle_ttl;
-      addr;
+      host;
       domain;
       idle = [];
       mutex = Eio.Mutex.create ();
@@ -92,7 +93,7 @@ module Conn_pool = struct
     | Some c -> (c, false)
     | None -> (
         (* No fresh idle connection; open a new one (still holding a permit). *)
-        try (t.dial t.addr t.domain, true)
+        try (t.dial t.host t.domain, true)
         with e ->
           Eio.Semaphore.release t.sem;
           raise e)
@@ -109,11 +110,11 @@ module Conn_pool = struct
   (* Re-point the pool at a new host, closing any idle connections to the old
      one. Connections currently checked out are discarded on release because
      they reach a server that redirects them. *)
-  let retarget t ~addr ~domain =
+  let retarget t ~host ~domain =
     Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
         List.iter (fun (c, _) -> try Eio.Resource.close c with _ -> ()) t.idle;
         t.idle <- [];
-        t.addr <- addr;
+        t.host <- host;
         t.domain <- domain)
 end
 
@@ -128,7 +129,6 @@ type t = {
   clock : any_clock;  (* for per-request timeouts *)
   scheme : string;
   port_suffix : string;  (* ":port" or "" *)
-  resolve : string -> Eio.Net.Sockaddr.stream;  (* host -> address *)
   retarget_mutex : Eio.Mutex.t;  (* serialises region redirects *)
   mutable host : string;  (* current endpoint host (may change on redirect) *)
   mutable region : string;  (* current signing region (may change on redirect) *)
@@ -140,14 +140,29 @@ let host_header t = t.host ^ t.port_suffix
 
 type error = {
   http_status : int;
+      (* The response's HTTP status, or [0] for a transport-level failure
+         (timeout, connection/TLS error) where no HTTP response was received; in
+         that case [code] is a symbolic tag and [message] the detail. *)
   code : string;
   message : string;
 }
 
 let pp_error fmt e =
-  Format.fprintf fmt "S3 error (HTTP %d)%s%s" e.http_status
-    (if e.code = "" then "" else ": " ^ e.code)
-    (if e.message = "" then "" else " - " ^ e.message)
+  let code_msg fmt e =
+    Format.fprintf fmt "%s%s"
+      (if e.code = "" then "" else ": " ^ e.code)
+      (if e.message = "" then "" else " - " ^ e.message)
+  in
+  if e.http_status = 0 then Format.fprintf fmt "S3 error%a" code_msg e
+  else Format.fprintf fmt "S3 error (HTTP %d)%a" e.http_status code_msg e
+
+(* An [error] for a transport-level failure: no HTTP response was received, so
+   [http_status] is [0], [code] a symbolic tag, and [message] the detail. *)
+let transport_error = function
+  | Eio.Time.Timeout ->
+      { http_status = 0; code = "Timeout";
+        message = "request exceeded the response timeout" }
+  | e -> { http_status = 0; code = "Transport"; message = Printexc.to_string e }
 
 type metadata = {
   content_length : int;
@@ -207,12 +222,21 @@ let domain_of_host host =
    connections, long enough to reuse within a multipart burst. *)
 let idle_connection_ttl = 10.0
 
-(* Per-request-attempt timeout. A request wedged on a half-closed connection
-   (write blocked on TCP back-pressure to a peer that has gone away) would
-   otherwise hang forever — cohttp-eio has no timeout. On expiry the attempt is
-   treated like any other failure: the connection is discarded and, if it was a
-   reused one, the request is retried on a fresh connection. *)
-let request_attempt_timeout = 120.0
+(* Timeout bounding a single request attempt up to the point the response
+   headers arrive — connection, request send, and the wait for the status line
+   and headers. It deliberately does {e not} cover streaming the response body,
+   so a large or slow download is never killed mid-transfer. Its purpose is the
+   original backstop: a write wedged on a half-closed pooled connection (blocked
+   on TCP back-pressure to a peer that has gone away) raises nothing and never
+   returns — cohttp-eio has no timeout — so cap the request phase here. On expiry
+   the attempt is treated like any other failure: the connection is discarded
+   and, if it was reused, the request is retried on a fresh connection. *)
+let response_timeout = 120.0
+
+(* Per-address TCP connect timeout. Bounds each connect attempt so a black-holed
+   address fails over to the next quickly instead of hanging (the OS connect
+   timeout can be minutes). Generous — a healthy connect is well under a second. *)
+let connect_timeout = 10.0
 
 let create ~sw ~net ~clock config =
   let uri = Uri.of_string config.endpoint in
@@ -224,27 +248,47 @@ let create ~sw ~net ~clock config =
   in
   let now () = Eio.Time.now clock in
   let service = match port with Some p -> string_of_int p | None -> scheme in
-  let resolve host =
-    match Eio.Net.getaddrinfo_stream ~service net host with
-    | a :: _ -> a
-    | [] -> Fmt.failwith "s3: could not resolve host %s" host
-  in
   let tls_config =
     if scheme = "https" then
       Some (make_tls_config ~now ~tls_verification:config.tls_verification)
     else None
   in
-  (* Open a new connection to a given target (TCP, plus a TLS handshake for
-     https). The handshake happens once per connection and is amortised across
-     all requests reusing it. *)
-  let dial addr domain : conn =
-    let tcp = Eio.Net.connect ~sw net addr in
+  (* Round-robin starting offset so successive dials spread across all the
+     addresses a load-balanced host publishes (e.g. an RGW behind many IPs)
+     rather than pinning to whichever the resolver lists first. *)
+  let dial_rotation = ref 0 in
+  (* Open a new connection to a target host: resolve it, then connect (TCP),
+     trying each resolved address in turn — starting at the rotating offset and
+     wrapping — so a dead address fails over to the next and load spreads across
+     them. For https the TLS handshake runs once per connection, amortised
+     across reuse. Resolution and connection happen here, at dial time, so DNS
+     and connect failures surface through [call]'s error handling as an [Error]
+     rather than raising from [create]. *)
+  let dial host domain : conn =
+    let addrs = Array.of_list (Eio.Net.getaddrinfo_stream ~service net host) in
+    let n = Array.length addrs in
+    if n = 0 then Fmt.failwith "s3: could not resolve host %s" host;
+    let start = !dial_rotation mod n in
+    incr dial_rotation;
+    let connect_tcp addr =
+      Eio.Time.with_timeout_exn clock connect_timeout (fun () ->
+          Eio.Net.connect ~sw net addr)
+    in
+    let rec connect i =
+      let addr = addrs.((start + i) mod n) in
+      if i = n - 1 then connect_tcp addr (* last candidate: let its error stand *)
+      else
+        try connect_tcp addr with
+        | Eio.Cancel.Cancelled _ as e -> raise e
+        | _ -> connect (i + 1)
+    in
+    let tcp = connect 0 in
     match tls_config with
     | None -> (tcp :> conn)
     | Some cfg -> (Tls_eio.client_of_flow cfg ?host:domain tcp :> conn)
   in
   let pool =
-    Conn_pool.create ~addr:(resolve host) ~domain:(domain_of_host host) ~dial
+    Conn_pool.create ~host ~domain:(domain_of_host host) ~dial
       ~max:config.max_connections ~now ~idle_ttl:idle_connection_ttl
   in
   {
@@ -254,7 +298,6 @@ let create ~sw ~net ~clock config =
     clock = Clock clock;
     scheme;
     port_suffix;
-    resolve;
     retarget_mutex = Eio.Mutex.create ();
     host;
     region = config.region;
@@ -350,8 +393,8 @@ let retarget t ~new_region =
         with
         | None -> `Cannot
         | Some new_host ->
-            let addr = t.resolve new_host in
-            Conn_pool.retarget t.pool ~addr ~domain:(domain_of_host new_host);
+            Conn_pool.retarget t.pool ~host:new_host
+              ~domain:(domain_of_host new_host);
             t.host <- new_host;
             t.region <- new_region;
             Log.debug (fun m ->
@@ -411,31 +454,38 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     Log.debug (fun m -> m "%a %s" Http.Method.pp meth target);
     let (Clock clk) = t.clock in
     let attempt () =
-      let conn, fresh = Conn_pool.acquire t.pool in
+      (* Acquiring dials a fresh connection when the pool has no live idle one;
+         a connect/TLS failure here is a transport error. On that path [acquire]
+         has already released its permit and there is no connection to discard,
+         so surface it directly (no retry — an immediate redial would just fail
+         again). *)
+      match Conn_pool.acquire t.pool with
+      | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+      | exception e -> `Failed (transport_error e)
+      | conn, fresh -> (
       (* cohttp-eio drives the HTTP over the connection we hand it; it never
          closes the socket, so we own its lifecycle. *)
       let client = Cohttp_eio.Client.make_generic (fun ~sw:_ _uri -> conn) in
       match
-        (* Per-attempt timeout: a write wedged on a half-closed pooled
-           connection raises nothing and never returns, so cap it here. On
-           expiry the [exception] arm discards the connection and (for a reused
-           one) retries on a fresh connection. *)
-        Eio.Time.with_timeout_exn clk request_attempt_timeout (fun () ->
-            Eio.Switch.run (fun sw ->
-                let resp, rbody =
+        Eio.Switch.run (fun sw ->
+            (* Time only the request phase — connect, send, and receiving the
+               response headers (see [response_timeout]). The body, streamed by
+               [f] below, runs untimed so large downloads are not killed. *)
+            let resp, rbody =
+              Eio.Time.with_timeout_exn clk response_timeout (fun () ->
                   Cohttp_eio.Client.call client ~sw ~headers
-                    ~body:(Cohttp_eio.Body.of_string body) meth uri
+                    ~body:(Cohttp_eio.Body.of_string body) meth uri)
+            in
+            match (if follow > 0 then redirect_region t resp else None) with
+            | Some new_region ->
+                (* Drain the (small) redirect body so the connection stays
+                   reusable, then signal a redirect rather than calling [f]. *)
+                let _ : string =
+                  Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536
+                    rbody
                 in
-                match (if follow > 0 then redirect_region t resp else None) with
-                | Some new_region ->
-                    (* Drain the (small) redirect body so the connection stays
-                       reusable, then signal a redirect rather than calling [f]. *)
-                    let _ : string =
-                      Eio.Buf_read.parse_exn Eio.Buf_read.take_all
-                        ~max_size:65536 rbody
-                    in
-                    `Redirect (resp, new_region)
-                | None -> `Done (resp, f resp rbody)))
+                `Redirect (resp, new_region)
+            | None -> `Done (resp, f resp rbody))
       with
       | `Done (resp, result) ->
           if connection_should_close resp then Conn_pool.discard t.pool conn
@@ -447,15 +497,20 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
           `Follow new_region
       | exception (Eio.Cancel.Cancelled _ as e) ->
           (* External cancellation (caller's switch failing) must propagate,
-             not be turned into a retry. *)
+             not be turned into a retry or an [Error]. *)
           Conn_pool.discard t.pool conn;
           raise e
       | exception e ->
+          (* Transport failure: timeout, connection/TLS error, or a body stream
+             that died mid-read. Retry once on a fresh connection to absorb a
+             server-closed idle socket; otherwise surface it as an [Error]
+             rather than letting it escape the result-typed API. *)
           Conn_pool.discard t.pool conn;
-          if fresh then raise e else `Retry_conn
+          if fresh then `Failed (transport_error e) else `Retry_conn)
     in
     match attempt () with
     | `Ok result -> result
+    | `Failed error -> Error error
     | `Retry_conn -> go ~follow (* stale reused connection; retry as-is *)
     | `Follow new_region -> (
         match retarget t ~new_region with
@@ -752,6 +807,23 @@ let abort_multipart t ~bucket ~key ~upload_id =
        (fun resp rbody ->
          if is_success resp then Ok () else Error (error_of_response resp (read_body rbody))))
 
+(* S3 caps a multipart upload/copy at 10,000 parts. Check up front so an
+   over-small part size fails fast with a clear error instead of being rejected
+   opaquely at CompleteMultipartUpload after uploading thousands of parts. *)
+let max_upload_parts = 10000
+let part_count ~size ~part_size = (size + part_size - 1) / part_size
+
+let too_many_parts_error ~size ~part_size =
+  {
+    http_status = 0;
+    code = "TooManyParts";
+    message =
+      Printf.sprintf
+        "%d parts (size %d, part_size %d) exceeds the S3 maximum of %d; use a \
+         larger part size"
+        (part_count ~size ~part_size) size part_size max_upload_parts;
+  }
+
 let multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
     ~max_concurrency ~path =
   let extra_headers =
@@ -815,6 +887,8 @@ let put_file t ~bucket ~key ?content_type ?(metadata = [])
   if size <= multipart_threshold then
     let data = Eio.Path.load path in
     put_string t ~bucket ~key ?content_type ~metadata data
+  else if part_count ~size ~part_size > max_upload_parts then
+    Error (too_many_parts_error ~size ~part_size)
   else
     multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
       ~max_concurrency ~path
@@ -946,6 +1020,8 @@ let copy_object t ~src_bucket ~src_key ~dst_bucket ~dst_key ?content_type
       if md.content_length <= multipart_threshold then
         copy_object_single t ~src_bucket ~src_key ~dst_bucket ~dst_key
           ?content_type ~metadata ()
+      else if part_count ~size:md.content_length ~part_size > max_upload_parts
+      then Error (too_many_parts_error ~size:md.content_length ~part_size)
       else
         let content_type =
           match content_type with Some _ as c -> c | None -> md.content_type
