@@ -22,24 +22,11 @@ let make_config ?(region = "us-east-1") ?(path_style = true)
 type conn = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
 
 (* A pool of keep-alive connections to one endpoint. cohttp-eio has no built-in
-   connection cache (its client is just [sw -> uri -> connection]) and does no
-   liveness checking, so reuse, staleness and timeouts are all ours to manage.
-   [make_generic] lets us supply the socket for a request; we hand out pooled
-   sockets and recycle them once the response body has been consumed. The
-   semaphore bounds the number of live connections; [idle] holds ready-to-reuse
-   ones, each stamped with the time it was released.
-
-   Staleness: S3 endpoints (and the load balancers in front of them) routinely
-   close idle keep-alive connections. A pooled connection the server has closed
-   sits in [CLOSE_WAIT]; writing the next request to it blocks on TCP
-   back-pressure forever (no error, no timeout) — a hang. So [acquire] discards
-   any idle connection that has sat unused longer than [idle_ttl] and dials a
-   fresh one instead. The per-request timeout in [call] is the backstop for the
-   race where a connection dies inside that window.
-
-   The target [addr]/[domain] are mutable so the pool can be re-pointed at a
-   different host when the server issues a region redirect; [dial] opens a fresh
-   connection (TCP, plus a TLS handshake for https) to the current target. *)
+   pool or liveness checking, so reuse and staleness are ours: [make_generic]
+   supplies the socket per request, connections are recycled once a response body
+   is consumed, the semaphore bounds how many are live, and [idle] holds reusable
+   ones stamped with their release time (so [acquire] can retire stale ones).
+   [host]/[domain] are mutable so the pool can be re-pointed on a region redirect. *)
 module Conn_pool = struct
   type t = {
     dial : string -> [ `host ] Domain_name.t option -> conn;
@@ -140,9 +127,8 @@ let host_header t = t.host ^ t.port_suffix
 
 type error = {
   http_status : int;
-      (* The response's HTTP status, or [0] for a transport-level failure
-         (timeout, connection/TLS error) where no HTTP response was received; in
-         that case [code] is a symbolic tag and [message] the detail. *)
+      (* Response HTTP status, or [0] when none was received (transport error or
+         client-side precondition); then [code] is a tag and [message] the detail. *)
   code : string;
   message : string;
 }
@@ -156,8 +142,7 @@ let pp_error fmt e =
   if e.http_status = 0 then Format.fprintf fmt "S3 error%a" code_msg e
   else Format.fprintf fmt "S3 error (HTTP %d)%a" e.http_status code_msg e
 
-(* An [error] for a transport-level failure: no HTTP response was received, so
-   [http_status] is [0], [code] a symbolic tag, and [message] the detail. *)
+(* Build an [error] for a failure with no HTTP response. *)
 let transport_error = function
   | Eio.Time.Timeout ->
       { http_status = 0; code = "Timeout";
@@ -176,10 +161,8 @@ let src = Logs.Src.create "s3" ~doc:"S3 client"
 
 module Log = (val Logs.src_log src)
 
-(* The TLS stack (ocaml-tls) draws randomness from Mirage_crypto_rng's global
-   generator. [use_default] registers an OS-getrandom-backed generator; we do it
-   lazily, once per process, so HTTPS works out of the box without the caller
-   having to set up the RNG. It is harmless for plain-HTTP use. *)
+(* Register an OS-getrandom generator for ocaml-tls, lazily once per process, so
+   HTTPS works without caller setup. Harmless for plain HTTP. *)
 let ensure_rng = lazy (Mirage_crypto_rng_unix.use_default ())
 
 let read_file path = In_channel.with_open_bin path In_channel.input_all
@@ -216,26 +199,18 @@ let make_tls_config ~now ~tls_verification =
 let domain_of_host host =
   try Some (Domain_name.host_exn (Domain_name.of_string_exn host)) with _ -> None
 
-(* Pooled connections idle longer than this are assumed possibly closed by the
-   server / a load balancer and are discarded rather than reused (S3 LBs
-   routinely drop idle keep-alives). Short enough to retire sporadic
-   connections, long enough to reuse within a multipart burst. *)
+(* Retire idle pooled connections older than this. S3/LBs silently drop idle
+   keep-alives, and a write to a dead socket hangs; short enough to retire those,
+   long enough to reuse within a multipart burst. *)
 let idle_connection_ttl = 10.0
 
-(* Timeout bounding a single request attempt up to the point the response
-   headers arrive — connection, request send, and the wait for the status line
-   and headers. It deliberately does {e not} cover streaming the response body,
-   so a large or slow download is never killed mid-transfer. Its purpose is the
-   original backstop: a write wedged on a half-closed pooled connection (blocked
-   on TCP back-pressure to a peer that has gone away) raises nothing and never
-   returns — cohttp-eio has no timeout — so cap the request phase here. On expiry
-   the attempt is treated like any other failure: the connection is discarded
-   and, if it was reused, the request is retried on a fresh connection. *)
+(* Bounds a request attempt up to the response headers — connect, send, status
+   and headers — but not body streaming, so large downloads aren't killed. Caps a
+   write wedged on a half-closed socket, which otherwise hangs with no error. *)
 let response_timeout = 120.0
 
-(* Per-address TCP connect timeout. Bounds each connect attempt so a black-holed
-   address fails over to the next quickly instead of hanging (the OS connect
-   timeout can be minutes). Generous — a healthy connect is well under a second. *)
+(* Per-address connect timeout, so a black-holed address fails over to the next
+   quickly rather than waiting out the (minutes-long) OS connect timeout. *)
 let connect_timeout = 10.0
 
 let create ~sw ~net ~clock config =
@@ -253,17 +228,13 @@ let create ~sw ~net ~clock config =
       Some (make_tls_config ~now ~tls_verification:config.tls_verification)
     else None
   in
-  (* Round-robin starting offset so successive dials spread across all the
-     addresses a load-balanced host publishes (e.g. an RGW behind many IPs)
-     rather than pinning to whichever the resolver lists first. *)
+  (* Rotating start offset so dials spread across all the addresses a
+     load-balanced host publishes, rather than pinning to the first. *)
   let dial_rotation = ref 0 in
-  (* Open a new connection to a target host: resolve it, then connect (TCP),
-     trying each resolved address in turn — starting at the rotating offset and
-     wrapping — so a dead address fails over to the next and load spreads across
-     them. For https the TLS handshake runs once per connection, amortised
-     across reuse. Resolution and connection happen here, at dial time, so DNS
-     and connect failures surface through [call]'s error handling as an [Error]
-     rather than raising from [create]. *)
+  (* Open a connection to [host]: resolve, then try each address (from the
+     rotating offset, wrapping) so a dead one fails over and load spreads; https
+     adds a TLS handshake. Resolving here, at dial time, lets DNS and connect
+     failures surface through [call] as an [Error] rather than raise in [create]. *)
   let dial host domain : conn =
     let addrs = Array.of_list (Eio.Net.getaddrinfo_stream ~service net host) in
     let n = Array.length addrs in
@@ -359,11 +330,9 @@ let replace_first s ~sub ~by =
       ^ String.sub s (i + String.length sub)
           (String.length s - i - String.length sub)
 
-(* Work out the host for a bucket that lives in [new_region], given the current
-   [old_host]/[old_region]. Handles AWS regional endpoints (replace the region
-   token, or build [s3.<region>.amazonaws.com] for the regionless endpoint).
-   Returns [None] for hosts we don't know how to rewrite (e.g. a custom RGW),
-   in which case we do not follow. *)
+(* Host for the same bucket in [new_region]: replace the region token, or build
+   [s3.<region>.amazonaws.com] for the regionless endpoint. [None] for hosts we
+   can't rewrite (e.g. a custom RGW), so we don't follow the redirect. *)
 let derive_host ~old_host ~old_region ~new_region =
   if old_region <> "" && find_sub old_host old_region <> None then
     Some (replace_first old_host ~sub:old_region ~by:new_region)
@@ -401,16 +370,10 @@ let retarget t ~new_region =
                 m "following region redirect to %s (%s)" new_region new_host);
             `Retargeted)
 
-(* Run a single signed request. [f] is called with the response and its body
-   flow, which it must consume before returning (so the connection is left at a
-   clean boundary and can be recycled).
-
-   The connection comes from the pool; on success it is returned for reuse
-   (unless the server asked to close), and on failure it is discarded. A request
-   that fails on a {e reused} connection is retried once on a fresh one, to
-   absorb connections the server closed while they sat idle. If the server
-   redirects to another region, the client is re-pointed there and the request
-   replayed (up to a small bound). *)
+(* Run one signed request. [f] receives the response and body flow, and must
+   consume the body before returning so the connection ends at a clean boundary
+   and can be recycled. A failure on a reused connection is retried once on a
+   fresh one; a region redirect re-points the client and replays (bounded). *)
 let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     =
   let path = raw_path ~bucket ~key in
@@ -422,8 +385,7 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     let headers =
       match t.config.credentials with
       | None ->
-          (* Anonymous (unsigned) request: no SigV4 signature, no Authorization
-             header, no x-amz-date. For public buckets / objects. *)
+          (* Anonymous: unsigned, no Authorization/x-amz-* headers. *)
           Http.Header.of_list (("host", host_header t) :: extra_headers)
       | Some creds ->
           let amz_date = Auth.amz_date_of_posix (t.now ()) in
@@ -454,23 +416,19 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     Log.debug (fun m -> m "%a %s" Http.Method.pp meth target);
     let (Clock clk) = t.clock in
     let attempt () =
-      (* Acquiring dials a fresh connection when the pool has no live idle one;
-         a connect/TLS failure here is a transport error. On that path [acquire]
-         has already released its permit and there is no connection to discard,
-         so surface it directly (no retry — an immediate redial would just fail
-         again). *)
+      (* A dial failure here has no connection to discard ([acquire] already
+         released its permit) and isn't retried — an immediate redial would just
+         fail again. *)
       match Conn_pool.acquire t.pool with
       | exception (Eio.Cancel.Cancelled _ as e) -> raise e
       | exception e -> `Failed (transport_error e)
       | conn, fresh -> (
-      (* cohttp-eio drives the HTTP over the connection we hand it; it never
-         closes the socket, so we own its lifecycle. *)
+      (* We own the socket lifecycle; cohttp-eio never closes it. *)
       let client = Cohttp_eio.Client.make_generic (fun ~sw:_ _uri -> conn) in
       match
         Eio.Switch.run (fun sw ->
-            (* Time only the request phase — connect, send, and receiving the
-               response headers (see [response_timeout]). The body, streamed by
-               [f] below, runs untimed so large downloads are not killed. *)
+            (* Time only the request phase (see [response_timeout]); [f]'s body
+               streaming below is untimed. *)
             let resp, rbody =
               Eio.Time.with_timeout_exn clk response_timeout (fun () ->
                   Cohttp_eio.Client.call client ~sw ~headers
@@ -478,8 +436,8 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
             in
             match (if follow > 0 then redirect_region t resp else None) with
             | Some new_region ->
-                (* Drain the (small) redirect body so the connection stays
-                   reusable, then signal a redirect rather than calling [f]. *)
+                (* Drain the (small) redirect body to keep the connection
+                   reusable, then signal a redirect instead of calling [f]. *)
                 let _ : string =
                   Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536
                     rbody
@@ -496,15 +454,12 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
           else Conn_pool.release t.pool conn;
           `Follow new_region
       | exception (Eio.Cancel.Cancelled _ as e) ->
-          (* External cancellation (caller's switch failing) must propagate,
-             not be turned into a retry or an [Error]. *)
+          (* Caller cancellation must propagate, not become a retry or [Error]. *)
           Conn_pool.discard t.pool conn;
           raise e
       | exception e ->
-          (* Transport failure: timeout, connection/TLS error, or a body stream
-             that died mid-read. Retry once on a fresh connection to absorb a
-             server-closed idle socket; otherwise surface it as an [Error]
-             rather than letting it escape the result-typed API. *)
+          (* Transport failure (timeout, connection/TLS, dead body stream): retry
+             once on a fresh connection, else surface as [Error]. *)
           Conn_pool.discard t.pool conn;
           if fresh then `Failed (transport_error e) else `Retry_conn)
     in
@@ -808,8 +763,7 @@ let abort_multipart t ~bucket ~key ~upload_id =
          if is_success resp then Ok () else Error (error_of_response resp (read_body rbody))))
 
 (* S3 caps a multipart upload/copy at 10,000 parts. Check up front so an
-   over-small part size fails fast with a clear error instead of being rejected
-   opaquely at CompleteMultipartUpload after uploading thousands of parts. *)
+   over-small part size fails fast instead of being rejected at completion. *)
 let max_upload_parts = 10000
 let part_count ~size ~part_size = (size + part_size - 1) / part_size
 

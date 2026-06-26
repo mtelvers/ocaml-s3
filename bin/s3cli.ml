@@ -1,9 +1,6 @@
-(* s3cli — a small S3 / Ceph RGW command-line client built on the [s3] library.
-
-   It deliberately mirrors a useful subset of the s5cmd / aws-cli surface:
-   listing (paginated), copying in either direction, and removing objects.
-   Connection settings are resolved from flags, environment variables, or an
-   AWS-style profile in ~/.aws, in that order of precedence. *)
+(* s3cli — a small S3 / Ceph RGW command-line client on the [s3] library,
+   mirroring a subset of the s5cmd / aws-cli surface. Connection settings come
+   from flags, then environment variables, then a ~/.aws profile. *)
 
 open Cmdliner
 
@@ -42,11 +39,9 @@ type conn = {
   max_connections : int;
 }
 
-(* Precedence: explicit flag, then environment, then the selected ~/.aws
-   profile, then a built-in default where one is sensible. Endpoint and region
-   come from the [config] file; credentials are resolved by the library's
-   provider chain (env, then the credentials file), with explicit
-   --access-key/--secret-key taking priority. *)
+(* Precedence: flag, then environment, then profile, then a default. Endpoint
+   and region come from the config file; credentials from the library's chain
+   (env, then credentials file), with explicit --access-key/--secret-key first. *)
 let resolve (c : common) : (conn, string) result =
   let getenv = S3.Credentials.getenv in
   let profile =
@@ -554,11 +549,9 @@ let main_cmd =
   Cmd.group (Cmd.info "s3cli" ~version:"0.1.0" ~doc ~man)
     [ ls_cmd; cp_cmd; rm_cmd; stat_cmd; mb_cmd; rb_cmd ]
 
-(* Allow the shared connection options to appear *before* the subcommand
-   (s5cmd / aws-cli style, e.g. [s3cli --endpoint-url URL ls ...]). cmdliner
-   attaches them to each subcommand, so it would otherwise reject them ahead of
-   the command name. We relocate any leading recognised global options to just
-   after the subcommand, leaving every other ordering untouched. *)
+(* Let the global options appear before the subcommand (s5cmd/aws-cli style,
+   [s3cli --endpoint-url URL ls ...]). cmdliner attaches them per-subcommand, so
+   relocate any leading recognised globals to just after the subcommand name. *)
 let reorder_argv argv =
   let value_opts =
     [ "--endpoint-url"; "--profile"; "--region"; "--access-key";

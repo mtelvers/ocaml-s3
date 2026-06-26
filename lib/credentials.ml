@@ -7,13 +7,11 @@ type t = {
 let home () = match Sys.getenv_opt "HOME" with Some h -> h | None -> "."
 let default_file () = Filename.concat (home ()) ".aws/credentials"
 
-(* [Some v] only for a set, non-empty variable; an explicitly empty value is
-   treated as unset, the same as an empty profile entry (see [non_empty]). *)
+(* Environment variable [k], or [None] if unset or empty. *)
 let getenv k =
   match Sys.getenv_opt k with Some "" | None -> None | Some v -> Some v
 
-(* An empty string is treated as absent, so a blank entry never yields a
-   credential (which would otherwise be signed into a malformed request). *)
+(* Treat an empty value as absent, so a blank entry never yields a credential. *)
 let non_empty = function Some "" | None -> None | some -> some
 
 let from_env () =
@@ -25,18 +23,13 @@ let from_env () =
         "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not both set in the \
          environment"
 
-(* Parse an AWS-style INI file (shared credentials or config) into
-   [section -> (key, value) list].
-
-   Section headers spelled [NAME] and [profile NAME] both yield [NAME]: the
-   config file prefixes non-default profiles with "profile ", whereas the
-   credentials file does not. Blank/comment lines, and indented continuation
-   lines (the nested "s3 =" sub-block and the like), are skipped. Keys appearing
-   before any section header are ignored. Returns [] if the file is absent. *)
+(* Parse an AWS-style INI file into [section -> (key, value) list]. Headers
+   [NAME] and [profile NAME] both yield [NAME] (config prefixes non-default
+   profiles with "profile "); blank/comment lines, indented sub-keys, and keys
+   before the first header are ignored. [] if the file is absent. *)
 let parse_ini path =
   if not (Sys.file_exists path) then []
   else
-    (* config uses "[profile NAME]"; credentials uses "[NAME]" — both yield NAME. *)
     let section_name trimmed =
       let name = String.trim (String.sub trimmed 1 (String.length trimmed - 2)) in
       match String.split_on_char ' ' name with [ "profile"; n ] -> n | _ -> name
