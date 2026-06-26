@@ -79,15 +79,16 @@ type common = {
   region : string option;
   access_key : string option;
   secret_key : string option;
+  no_sign : bool;
   no_verify : bool;
   ca_bundle : string option;
 }
 
-(* A fully-resolved connection. *)
+(* A fully-resolved connection. [credentials = None] is anonymous mode. *)
 type conn = {
   endpoint : string;
   region : string;
-  credentials : S3.Credentials.t;
+  credentials : S3.Credentials.t option;
   tls : S3.Client.tls_verification;
   max_connections : int;
 }
@@ -117,15 +118,18 @@ let resolve (c : common) : (conn, string) result =
     <|> Some "us-east-1"
   in
   let credentials =
-    match (c.access_key, c.secret_key) with
-    | Some access_key, Some secret_key ->
-        Ok
-          {
-            S3.Credentials.access_key;
-            secret_key;
-            session_token = Sys.getenv_opt "AWS_SESSION_TOKEN";
-          }
-    | _ -> S3.Credentials.default_chain ~profile ()
+    if c.no_sign then Ok None
+    else
+      match (c.access_key, c.secret_key) with
+      | Some access_key, Some secret_key ->
+          Ok
+            (Some
+               {
+                 S3.Credentials.access_key;
+                 secret_key;
+                 session_token = Sys.getenv_opt "AWS_SESSION_TOKEN";
+               })
+      | _ -> Result.map Option.some (S3.Credentials.default_chain ~profile ())
   in
   (* --ca-bundle takes precedence over --no-verify; default is system trust. *)
   let tls =
@@ -205,7 +209,7 @@ let with_client conn f =
   let net = Eio.Stdenv.net env and clock = Eio.Stdenv.clock env in
   let cfg =
     S3.Client.make_config ~endpoint:conn.endpoint ~region:conn.region
-      ~credentials:conn.credentials ~tls_verification:conn.tls
+      ?credentials:conn.credentials ~tls_verification:conn.tls
       ~max_connections:conn.max_connections ()
   in
   f env (S3.Client.create ~sw ~net ~clock cfg)
@@ -407,6 +411,14 @@ let secret_key_arg =
     & info [ "secret-key" ] ~docv:"KEY"
         ~env:(Cmd.Env.info "AWS_SECRET_ACCESS_KEY") ~doc)
 
+let no_sign_arg =
+  let doc =
+    "Make unsigned, anonymous requests (no credentials sent), for reading \
+     public buckets. Takes precedence over any supplied or configured \
+     credentials."
+  in
+  Arg.(value & flag & info [ "no-sign-request" ] ~doc)
+
 let no_verify_arg =
   let doc =
     "Do not verify the server's TLS certificate (insecure; for https \
@@ -427,12 +439,22 @@ let ca_bundle_arg =
 (* All shared connection options, gathered into a single value passed to every
    command. *)
 let common_term =
-  let make endpoint profile region access_key secret_key no_verify ca_bundle =
-    { endpoint; profile; region; access_key; secret_key; no_verify; ca_bundle }
+  let make endpoint profile region access_key secret_key no_sign no_verify
+      ca_bundle =
+    {
+      endpoint;
+      profile;
+      region;
+      access_key;
+      secret_key;
+      no_sign;
+      no_verify;
+      ca_bundle;
+    }
   in
   Term.(
     const make $ endpoint_arg $ profile_arg $ region_arg $ access_key_arg
-    $ secret_key_arg $ no_verify_arg $ ca_bundle_arg)
+    $ secret_key_arg $ no_sign_arg $ no_verify_arg $ ca_bundle_arg)
 
 let ls_cmd =
   let uri =
@@ -587,7 +609,7 @@ let reorder_argv argv =
     [ "--endpoint-url"; "--profile"; "--region"; "--access-key";
       "--secret-key"; "--ca-bundle" ]
   in
-  let flag_opts = [ "--no-verify" ] in
+  let flag_opts = [ "--no-sign-request"; "--no-verify" ] in
   let subcommands = [ "ls"; "cp"; "rm"; "stat"; "mb"; "rb" ] in
   let opt_name t =
     match String.index_opt t '=' with Some i -> String.sub t 0 i | None -> t

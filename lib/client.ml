@@ -6,15 +6,16 @@ type tls_verification =
 type config = {
   endpoint : string;
   region : string;
-  credentials : Credentials.t;
+  credentials : Credentials.t option;
+      (* [None] makes anonymous, unsigned requests (for public buckets). *)
   path_style : bool;
   tls_verification : tls_verification;
   max_connections : int;
 }
 
 let make_config ?(region = "us-east-1") ?(path_style = true)
-    ?(tls_verification = System_trust) ?(max_connections = 8) ~endpoint
-    ~credentials () =
+    ?(tls_verification = System_trust) ?(max_connections = 8) ?credentials
+    ~endpoint () =
   { endpoint; region; credentials; path_style; tls_verification; max_connections }
 
 (* A connection usable by cohttp-eio: a two-way flow that can be closed. *)
@@ -279,10 +280,10 @@ let query_string = function
 let raw_path ~bucket ~key =
   if key = "" then "/" ^ bucket else "/" ^ bucket ^ "/" ^ key
 
-let auth_credentials config =
+let auth_credentials (creds : Credentials.t) =
   {
-    Auth.access_key = config.credentials.Credentials.access_key;
-    secret_key = config.credentials.Credentials.secret_key;
+    Auth.access_key = creds.Credentials.access_key;
+    secret_key = creds.Credentials.secret_key;
   }
 
 let connection_should_close resp =
@@ -375,26 +376,33 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
   in
   (* [follow] is the number of region redirects we are still willing to chase. *)
   let rec go ~follow =
-    let amz_date = Auth.amz_date_of_posix (t.now ()) in
-    let signed_headers =
-      [
-        ("host", host_header t);
-        ("x-amz-content-sha256", payload_hash);
-        ("x-amz-date", amz_date);
-      ]
-      @ (match t.config.credentials.Credentials.session_token with
-        | Some tok -> [ ("x-amz-security-token", tok) ]
-        | None -> [])
-      @ extra_headers
-    in
-    let authorization =
-      Auth.authorization_header ~credentials:(auth_credentials t.config)
-        ~region:t.region ~service:"s3"
-        ~meth:(Http.Method.to_string meth)
-        ~path ~query ~headers:signed_headers ~payload_hash ~amz_date
-    in
     let headers =
-      Http.Header.of_list (("Authorization", authorization) :: signed_headers)
+      match t.config.credentials with
+      | None ->
+          (* Anonymous (unsigned) request: no SigV4 signature, no Authorization
+             header, no x-amz-date. For public buckets / objects. *)
+          Http.Header.of_list (("host", host_header t) :: extra_headers)
+      | Some creds ->
+          let amz_date = Auth.amz_date_of_posix (t.now ()) in
+          let signed_headers =
+            [
+              ("host", host_header t);
+              ("x-amz-content-sha256", payload_hash);
+              ("x-amz-date", amz_date);
+            ]
+            @ (match creds.Credentials.session_token with
+              | Some tok -> [ ("x-amz-security-token", tok) ]
+              | None -> [])
+            @ extra_headers
+          in
+          let authorization =
+            Auth.authorization_header ~credentials:(auth_credentials creds)
+              ~region:t.region ~service:"s3"
+              ~meth:(Http.Method.to_string meth)
+              ~path ~query ~headers:signed_headers ~payload_hash ~amz_date
+          in
+          Http.Header.of_list
+            (("Authorization", authorization) :: signed_headers)
     in
     let target =
       Auth.uri_encode ~encode_slash:false path ^ query_string query

@@ -26,7 +26,10 @@ type config = {
           ["https://s3.example.com"]. Both [http] and [https] are supported;
           the scheme selects whether TLS is used. *)
   region : string;  (** Signing region, e.g. ["us-east-1"]. *)
-  credentials : Credentials.t;  (** Access key, secret, optional session token. *)
+  credentials : Credentials.t option;
+      (** Access key, secret, optional session token. [None] selects anonymous
+          mode: requests are sent unsigned, with no [Authorization] header, for
+          reading public buckets. *)
   path_style : bool;
       (** When [true] (the default via {!make_config}), objects are addressed as
           [endpoint/bucket/key]. RGW and MinIO require this unless configured
@@ -40,18 +43,19 @@ type config = {
 }
 
 (** [make_config ?region ?path_style ?tls_verification ?max_connections
-    ~endpoint ~credentials ()] builds a {!config} with sensible defaults
+    ?credentials ~endpoint ()] builds a {!config} with sensible defaults
     ([region = "us-east-1"], [path_style = true],
     [tls_verification = System_trust], [max_connections = 8]).
     See {!module:Credentials} for resolving [credentials] from the environment
-    or a shared credentials file. *)
+    or a shared credentials file. Omitting [credentials] selects anonymous
+    mode (unsigned requests) for reading public buckets. *)
 val make_config :
   ?region:string ->
   ?path_style:bool ->
   ?tls_verification:tls_verification ->
   ?max_connections:int ->
+  ?credentials:Credentials.t ->
   endpoint:string ->
-  credentials:Credentials.t ->
   unit ->
   config
 

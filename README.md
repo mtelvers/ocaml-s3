@@ -145,6 +145,17 @@ environment variable, then the selected `~/.aws` profile:
 | Profile | `--profile` | `AWS_PROFILE` | — |
 | CA bundle | `--ca-bundle` | `AWS_CA_BUNDLE` | — |
 | No TLS verify | `--no-verify` | — | — |
+| Anonymous | `--no-sign-request` | — | — |
+
+`--no-sign-request` sends unsigned, anonymous requests (no credentials), for
+reading public buckets — the same spelling as aws-cli. It takes precedence over
+any supplied or configured credentials, so no `~/.aws` profile or keys are
+needed:
+
+```sh
+./_build/default/bin/s3cli.exe --no-sign-request \
+  --endpoint-url https://s3.amazonaws.com ls s3://1000genomes/
+```
 
 > Global options may appear before *or* after the subcommand — both
 > `s3cli --endpoint-url … ls s3://…` (s5cmd-style) and
