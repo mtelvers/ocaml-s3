@@ -14,6 +14,13 @@ let hmac_raw ~key data = H.(to_raw_string (hmac_string ~key data))
 (* Hex HMAC-SHA256, used for the final signature. *)
 let hmac_hex ~key data = H.(to_hex (hmac_string ~key data))
 
+(* SigV4 percent-encoding. Deliberately hand-rolled rather than using [Uri]:
+   the signature requires this exact unreserved set ([A-Za-z0-9-_.~]), uppercase
+   [%XX] hex, and the [encode_slash] distinction (slashes are preserved in the
+   canonical path but encoded in query parameters). [Uri]'s component encoders
+   follow different rules, so substituting them would silently break the
+   signature (SignatureDoesNotMatch). Same reason [canonical_query] builds the
+   query string by hand instead of via [Uri.encoded_of_query]. *)
 let uri_encode ~encode_slash s =
   let buf = Buffer.create (String.length s) in
   String.iter

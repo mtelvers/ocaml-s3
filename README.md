@@ -147,6 +147,15 @@ environment variable, then the selected `~/.aws` profile:
 | No TLS verify | `--no-verify` | — | — |
 | Anonymous | `--no-sign-request` | — | — |
 
+An empty environment variable is treated as unset (e.g. `AWS_REGION=` falls
+through to the profile/default rather than signing with an empty region).
+Credentials follow the usual AWS precedence — explicit `--access-key` /
+`--secret-key` (which must be given together), else `AWS_*` environment
+variables, else the profile's credentials. Because the environment is tried
+before the profile, setting `AWS_ACCESS_KEY_ID` while passing `--profile foo`
+takes the *endpoint and region* from `foo` but the *credentials* from the
+environment.
+
 `--no-sign-request` sends unsigned, anonymous requests (no credentials), for
 reading public buckets — the same spelling as aws-cli. It takes precedence over
 any supplied or configured credentials, so no `~/.aws` profile or keys are

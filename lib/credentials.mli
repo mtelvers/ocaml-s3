@@ -13,6 +13,26 @@ type t = {
           signed. [None] for long-lived keys. *)
 }
 
+(** [getenv k] is the value of environment variable [k], or [None] when it is
+    unset {e or} set to the empty string. Used so an explicitly empty [AWS_*]
+    variable is treated as absent rather than signed into a request. *)
+val getenv : string -> string option
+
+(** [parse_ini path] parses an AWS-style INI file (a shared credentials or
+    config file) into an [(section, (key, value) list) list]. Headers spelled
+    [\[NAME\]] and [\[profile NAME\]] both map to section [NAME]; blank and
+    comment lines, indented sub-keys, and keys before the first header are
+    ignored. Returns [] if [path] does not exist. *)
+val parse_ini : string -> (string * (string * string) list) list
+
+(** [ini_get sections ~section ~key] looks up [key] within [section] of a
+    {!parse_ini} result, or [None] if either is absent. *)
+val ini_get :
+  (string * (string * string) list) list ->
+  section:string ->
+  key:string ->
+  string option
+
 (** [from_env ()] reads [AWS_ACCESS_KEY_ID] and [AWS_SECRET_ACCESS_KEY] (and the
     optional [AWS_SESSION_TOKEN]) from the environment. [Error] with a message if
     either required variable is unset or empty. *)

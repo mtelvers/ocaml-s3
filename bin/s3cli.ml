@@ -11,60 +11,9 @@ open Cmdliner
 (* AWS-style ~/.aws/{credentials,config} parsing                          *)
 (* ---------------------------------------------------------------------- *)
 
-(* A very small INI reader: [section -> (key -> value)]. Only top-level
-   "key = value" lines are kept; indented sub-keys (e.g. the nested "s3 ="
-   block) are ignored, which is all we need. *)
-let read_ini path =
-  if not (Sys.file_exists path) then []
-  else begin
-    let ic = open_in path in
-    Fun.protect
-      ~finally:(fun () -> close_in_noerr ic)
-      (fun () ->
-        let sections = ref [] in
-        let current = ref "" in
-        let kvs = Hashtbl.create 16 in
-        (try
-           while true do
-             let line = input_line ic in
-             let trimmed = String.trim line in
-             if trimmed = "" || trimmed.[0] = '#' || trimmed.[0] = ';' then ()
-             else if trimmed.[0] = '[' && trimmed.[String.length trimmed - 1] = ']'
-             then begin
-               (* New section: stash the keys collected for the previous one. *)
-               if !current <> "" then
-                 sections := (!current, Hashtbl.copy kvs) :: !sections;
-               Hashtbl.reset kvs;
-               let name = String.sub trimmed 1 (String.length trimmed - 2) in
-               (* config uses "[profile NAME]"; credentials uses "[NAME]". *)
-               let name =
-                 match String.split_on_char ' ' (String.trim name) with
-                 | [ "profile"; n ] -> n
-                 | _ -> String.trim name
-               in
-               current := name
-             end
-             else if (not (String.length line > 0 && (line.[0] = ' ' || line.[0] = '\t')))
-                     && String.contains trimmed '='
-             then begin
-               let i = String.index trimmed '=' in
-               let k = String.trim (String.sub trimmed 0 i) in
-               let v =
-                 String.trim
-                   (String.sub trimmed (i + 1) (String.length trimmed - i - 1))
-               in
-               Hashtbl.replace kvs k v
-             end
-           done
-         with End_of_file -> ());
-        if !current <> "" then sections := (!current, Hashtbl.copy kvs) :: !sections;
-        !sections)
-  end
-
-let ini_get sections ~section ~key =
-  match List.assoc_opt section sections with
-  | None -> None
-  | Some kvs -> Hashtbl.find_opt kvs key
+(* INI parsing lives in the library ({!S3.Credentials.parse_ini}) so the
+   credentials and config files are read by a single parser, and empty values
+   are treated as absent consistently ({!S3.Credentials.getenv}). *)
 
 let home () = Option.value ~default:"." (Sys.getenv_opt "HOME")
 
@@ -99,22 +48,25 @@ type conn = {
    provider chain (env, then the credentials file), with explicit
    --access-key/--secret-key taking priority. *)
 let resolve (c : common) : (conn, string) result =
+  let getenv = S3.Credentials.getenv in
   let profile =
-    Option.value
-      ~default:(Option.value ~default:"default" (Sys.getenv_opt "AWS_PROFILE"))
-      c.profile
+    match c.profile with
+    | Some p -> p
+    | None -> Option.value ~default:"default" (getenv "AWS_PROFILE")
   in
-  let config = read_ini (Filename.concat (home ()) ".aws/config") in
+  let config =
+    S3.Credentials.parse_ini (Filename.concat (home ()) ".aws/config")
+  in
   let ( <|> ) a b = match a with Some _ -> a | None -> b in
   let endpoint =
     c.endpoint
-    <|> Sys.getenv_opt "AWS_ENDPOINT_URL"
-    <|> ini_get config ~section:profile ~key:"endpoint_url"
+    <|> getenv "AWS_ENDPOINT_URL"
+    <|> S3.Credentials.ini_get config ~section:profile ~key:"endpoint_url"
   in
   let region =
     c.region
-    <|> Sys.getenv_opt "AWS_REGION"
-    <|> ini_get config ~section:profile ~key:"region"
+    <|> getenv "AWS_REGION"
+    <|> S3.Credentials.ini_get config ~section:profile ~key:"region"
     <|> Some "us-east-1"
   in
   let credentials =
@@ -127,9 +79,12 @@ let resolve (c : common) : (conn, string) result =
                {
                  S3.Credentials.access_key;
                  secret_key;
-                 session_token = Sys.getenv_opt "AWS_SESSION_TOKEN";
+                 session_token = getenv "AWS_SESSION_TOKEN";
                })
-      | _ -> Result.map Option.some (S3.Credentials.default_chain ~profile ())
+      | Some _, None | None, Some _ ->
+          Error "both --access-key and --secret-key are required together"
+      | None, None ->
+          Result.map Option.some (S3.Credentials.default_chain ~profile ())
   in
   (* --ca-bundle takes precedence over --no-verify; default is system trust. *)
   let tls =
