@@ -117,6 +117,7 @@ type t = {
   scheme : string;
   port_suffix : string;  (* ":port" or "" *)
   retarget_mutex : Eio.Mutex.t;  (* serialises region redirects *)
+  rng : Random.State.t;  (* for backoff jitter *)
   mutable host : string;  (* current endpoint host (may change on redirect) *)
   mutable region : string;  (* current signing region (may change on redirect) *)
 }
@@ -213,6 +214,21 @@ let response_timeout = 120.0
    quickly rather than waiting out the (minutes-long) OS connect timeout. *)
 let connect_timeout = 10.0
 
+(* Transient server responses (throttling / gateway errors) are retried with
+   exponential backoff and full jitter, up to this many times, before the
+   response is handed to the caller as an error. *)
+let max_throttle_retries = 5
+let throttle_base_delay = 0.1 (* seconds, doubled per attempt *)
+let throttle_max_delay = 20.0
+
+let is_retryable_status code =
+  code = 429 || code = 500 || code = 502 || code = 503 || code = 504
+
+(* Full-jitter backoff: a random delay in [0, min(cap, base * 2^attempt)). *)
+let throttle_delay rng ~attempt_idx =
+  let exp = throttle_base_delay *. (2. ** float_of_int attempt_idx) in
+  Random.State.float rng (Float.min throttle_max_delay exp)
+
 let create ~sw ~net ~clock config =
   let uri = Uri.of_string config.endpoint in
   let scheme = Option.value ~default:"http" (Uri.scheme uri) in
@@ -270,6 +286,7 @@ let create ~sw ~net ~clock config =
     scheme;
     port_suffix;
     retarget_mutex = Eio.Mutex.create ();
+    rng = Random.State.make_self_init ();
     host;
     region = config.region;
   }
@@ -380,8 +397,8 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
   let payload_hash =
     if body = "" then Auth.empty_payload_hash else Auth.hex_sha256 body
   in
-  (* [follow] is the number of region redirects we are still willing to chase. *)
-  let rec go ~follow =
+  (* [follow] bounds region redirects; [retry] bounds transient-error backoffs. *)
+  let rec go ~follow ~retry =
     let headers =
       match t.config.credentials with
       | None ->
@@ -443,7 +460,17 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
                     rbody
                 in
                 `Redirect (resp, new_region)
-            | None -> `Done (resp, f resp rbody))
+            | None ->
+                if retry > 0 && is_retryable_status (status_code resp) then begin
+                  (* Drain the (small) error body to keep the connection
+                     reusable, then back off and retry instead of calling [f]. *)
+                  let _ : string =
+                    Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536
+                      rbody
+                  in
+                  `Throttle resp
+                end
+                else `Done (resp, f resp rbody))
       with
       | `Done (resp, result) ->
           if connection_should_close resp then Conn_pool.discard t.pool conn
@@ -453,6 +480,11 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
           if connection_should_close resp then Conn_pool.discard t.pool conn
           else Conn_pool.release t.pool conn;
           `Follow new_region
+      | `Throttle resp ->
+          (* Valid HTTP response, body drained: the connection is reusable. *)
+          if connection_should_close resp then Conn_pool.discard t.pool conn
+          else Conn_pool.release t.pool conn;
+          `Throttled (status_code resp)
       | exception (Eio.Cancel.Cancelled _ as e) ->
           (* Caller cancellation must propagate, not become a retry or [Error]. *)
           Conn_pool.discard t.pool conn;
@@ -466,13 +498,22 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     match attempt () with
     | `Ok result -> result
     | `Failed error -> Error error
-    | `Retry_conn -> go ~follow (* stale reused connection; retry as-is *)
+    | `Retry_conn -> go ~follow ~retry (* stale reused connection; retry as-is *)
+    | `Throttled status ->
+        let delay =
+          throttle_delay t.rng ~attempt_idx:(max_throttle_retries - retry)
+        in
+        Log.debug (fun m ->
+            m "transient HTTP %d; backing off %.2fs (%d retries left)" status
+              delay (retry - 1));
+        Eio.Time.sleep clk delay;
+        go ~follow ~retry:(retry - 1)
     | `Follow new_region -> (
         match retarget t ~new_region with
-        | `Cannot -> go ~follow:0 (* can't rewrite host; surface the error *)
-        | `Already | `Retargeted -> go ~follow:(follow - 1))
+        | `Cannot -> go ~follow:0 ~retry (* can't rewrite host; surface error *)
+        | `Already | `Retargeted -> go ~follow:(follow - 1) ~retry)
   in
-  go ~follow:3
+  go ~follow:3 ~retry:max_throttle_retries
 
 (* Drain a response body into a string, with a size cap to bound memory. *)
 let read_body ?(max_size = 16 * 1024 * 1024) rbody =

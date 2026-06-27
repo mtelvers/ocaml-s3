@@ -214,6 +214,16 @@ consumed, and a request that fails on a *reused* connection is retried once on a
 fresh one (to absorb server idle-close). The TLS handshake, for `https`
 endpoints, is part of opening a connection and so is amortised across reuse too.
 
+### Retries
+
+Transport failures (timeout, connection/TLS) and transient server responses
+(`429`, `500`, `502`, `503` — e.g. RGW/S3 `SlowDown` throttling, common when many
+multipart parts upload at once) are retried automatically with exponential
+backoff and full jitter, up to 5 times, before the error is returned. Each part
+backs off independently, so a throttled multipart upload spreads its retries
+rather than failing the whole transfer. Backoff happens between attempts and does
+not count against the per-request timeout.
+
 ### Comparison with s5cmd
 
 Two workloads on a Ceph RGW, ~1.4M-object bucket.
