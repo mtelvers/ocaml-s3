@@ -203,6 +203,81 @@ let () =
         or_fail "delete copy dst" (S3.Client.delete_object client ~bucket ~key:dst_key)
       in
 
+      (* A custom payload_hash hook must be invoked (once per non-empty body,
+         so once per part plus the completion XML) and must still produce a
+         byte-exact round-trip. *)
+      let test_payload_hash_hook () =
+        let calls = ref 0 in
+        let hooked =
+          S3.Client.create ~sw ~net ~clock
+            (S3.Client.make_config ?region ~endpoint ~credentials
+               ~payload_hash:(fun s ->
+                 incr calls;
+                 S3.Auth.hex_sha256 s)
+               ())
+        in
+        let size = (12 * 1024 * 1024) + 5 in
+        let src = tmp / "hook.bin" and dst = tmp / "hook.out" in
+        make_file src size;
+        let src_sha = sha256_file src in
+        let key = "hook/obj.bin" in
+        let _ : string =
+          or_fail "put_file hooked"
+            (S3.Client.put_file hooked ~bucket ~key
+               ~multipart_threshold:(5 * 1024 * 1024)
+               ~part_size:(5 * 1024 * 1024) ~path:src ())
+        in
+        (* 3 parts (5+5+~2 MiB), so the hook ran at least that many times. *)
+        Alcotest.(check bool)
+          "payload_hash hook invoked per part" true (!calls >= 3);
+        or_fail "get hooked" (S3.Client.get_to_file hooked ~bucket ~key ~path:dst);
+        Alcotest.(check string) "hooked round-trip sha256" src_sha
+          (sha256_file dst);
+        or_fail "delete hooked" (S3.Client.delete_object hooked ~bucket ~key)
+      in
+
+      (* Multi-domain: a payload_hash hook that offloads to an Eio.Executor_pool,
+         so several multipart parts hash on worker domains in parallel. The call
+         counter is an Atomic (incremented from worker domains — a plain ref
+         would race here), and the upload must still be byte-exact. *)
+      let test_payload_hash_pool () =
+        Eio.Switch.run @@ fun pool_sw ->
+        let pool =
+          Eio.Executor_pool.create ~sw:pool_sw
+            ~domain_count:(max 2 (min 4 (Domain.recommended_domain_count ())))
+            (Eio.Stdenv.domain_mgr env)
+        in
+        let calls = Atomic.make 0 in
+        let hooked =
+          S3.Client.create ~sw ~net ~clock
+            (S3.Client.make_config ?region ~endpoint ~credentials
+               ~payload_hash:(fun s ->
+                 Eio.Executor_pool.submit_exn pool ~weight:1.0 (fun () ->
+                     Atomic.incr calls;
+                     S3.Auth.hex_sha256 s))
+               ())
+        in
+        let size = (28 * 1024 * 1024) + 3 in
+        let src = tmp / "pool.bin" and dst = tmp / "pool.out" in
+        make_file src size;
+        let src_sha = sha256_file src in
+        let key = "hook/pool.bin" in
+        let _ : string =
+          or_fail "put_file pooled-hash"
+            (S3.Client.put_file hooked ~bucket ~key
+               ~multipart_threshold:(5 * 1024 * 1024)
+               ~part_size:(5 * 1024 * 1024) ~max_concurrency:4 ~path:src ())
+        in
+        (* 6 parts (5*5 + 3 MiB) → the hook ran at least that many times, on
+           worker domains. *)
+        Alcotest.(check bool)
+          "pooled hook invoked per part" true (Atomic.get calls >= 6);
+        or_fail "get pooled" (S3.Client.get_to_file hooked ~bucket ~key ~path:dst);
+        Alcotest.(check string) "pooled round-trip sha256" src_sha
+          (sha256_file dst);
+        or_fail "delete pooled" (S3.Client.delete_object hooked ~bucket ~key)
+      in
+
       let test_cleanup () =
         or_fail "delete_bucket" (S3.Client.delete_bucket client ~bucket)
       in
@@ -226,6 +301,10 @@ let () =
                     `Slow test_large_multipart;
                   Alcotest.test_case "multipart server-side copy" `Slow
                     test_multipart_copy;
+                  Alcotest.test_case "payload_hash hook" `Slow
+                    test_payload_hash_hook;
+                  Alcotest.test_case "payload_hash executor pool (multi-domain)"
+                    `Slow test_payload_hash_pool;
                   Alcotest.test_case "delete bucket" `Quick test_cleanup;
                 ] );
             ])

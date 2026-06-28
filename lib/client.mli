@@ -40,20 +40,36 @@ type config = {
       (** Maximum number of pooled connections to the endpoint kept open at
           once. This also bounds how many requests (e.g. multipart parts) run
           concurrently. *)
+  payload_hash : string -> string;
+      (** Computes the [x-amz-content-sha256] value for a (non-empty) request
+          body. Defaults to {!Auth.hex_sha256} — the digest the server verifies,
+          so it catches in-flight corruption. It is called once per non-empty
+          body, possibly concurrently from several fibers (one per in-flight
+          multipart part), so it must be fiber-safe.
+
+          Override it to move the (CPU-bound) hashing onto your own executor
+          pool — e.g.
+          [fun s -> Eio.Executor_pool.submit_exn pool ~weight:1.0 (fun () ->
+          Auth.hex_sha256 s)] — or return the literal ["UNSIGNED-PAYLOAD"] to
+          skip payload signing entirely (no body-integrity check; only wise over
+          TLS or a trusted link). *)
 }
 
 (** [make_config ?region ?path_style ?tls_verification ?max_connections
-    ?credentials ~endpoint ()] builds a {!config} with sensible defaults
-    ([region = "us-east-1"], [path_style = true],
-    [tls_verification = System_trust], [max_connections = 8]).
+    ?payload_hash ?credentials ~endpoint ()] builds a {!config} with sensible
+    defaults ([region = "us-east-1"], [path_style = true],
+    [tls_verification = System_trust], [max_connections = 8],
+    [payload_hash = Auth.hex_sha256]).
     See {!module:Credentials} for resolving [credentials] from the environment
     or a shared credentials file. Omitting [credentials] selects anonymous
-    mode (unsigned requests) for reading public buckets. *)
+    mode (unsigned requests) for reading public buckets. See the [payload_hash]
+    field for offloading body hashing or disabling payload signing. *)
 val make_config :
   ?region:string ->
   ?path_style:bool ->
   ?tls_verification:tls_verification ->
   ?max_connections:int ->
+  ?payload_hash:(string -> string) ->
   ?credentials:Credentials.t ->
   endpoint:string ->
   unit ->

@@ -11,12 +11,24 @@ type config = {
   path_style : bool;
   tls_verification : tls_verification;
   max_connections : int;
+  payload_hash : string -> string;
+      (* Computes [x-amz-content-sha256] for a non-empty body; default
+         [Auth.hex_sha256]. Override to offload hashing to your own pool, or
+         return ["UNSIGNED-PAYLOAD"] to skip payload signing. *)
 }
 
 let make_config ?(region = "us-east-1") ?(path_style = true)
-    ?(tls_verification = System_trust) ?(max_connections = 8) ?credentials
-    ~endpoint () =
-  { endpoint; region; credentials; path_style; tls_verification; max_connections }
+    ?(tls_verification = System_trust) ?(max_connections = 8)
+    ?(payload_hash = Auth.hex_sha256) ?credentials ~endpoint () =
+  {
+    endpoint;
+    region;
+    credentials;
+    path_style;
+    tls_verification;
+    max_connections;
+    payload_hash;
+  }
 
 (* A connection usable by cohttp-eio: a two-way flow that can be closed. *)
 type conn = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
@@ -395,7 +407,7 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
     =
   let path = raw_path ~bucket ~key in
   let payload_hash =
-    if body = "" then Auth.empty_payload_hash else Auth.hex_sha256 body
+    if body = "" then Auth.empty_payload_hash else t.config.payload_hash body
   in
   (* [follow] bounds region redirects; [retry] bounds transient-error backoffs. *)
   let rec go ~follow ~retry =

@@ -224,6 +224,27 @@ backs off independently, so a throttled multipart upload spreads its retries
 rather than failing the whole transfer. Backoff happens between attempts and does
 not count against the per-request timeout.
 
+### Payload hashing
+
+Every request is signed with `x-amz-content-sha256`, the SHA-256 of the body,
+which the server verifies (a corrupt part is rejected with
+`XAmzContentSHA256Mismatch`). For large multipart uploads this hashing is
+CPU-bound and runs inline on the calling fiber by default. `make_config
+~payload_hash` lets you redirect it: point it at your own Eio executor pool to
+hash parts across domains in parallel (the library never owns a pool of its own),
+or return the literal `"UNSIGNED-PAYLOAD"` to skip body signing entirely — no
+integrity check, so only over TLS or a trusted network.
+
+```ocaml
+let pool = Eio.Executor_pool.create ~sw (Eio.Stdenv.domain_mgr env) ~domain_count in
+let cfg =
+  S3.Client.make_config ~endpoint ~credentials
+    ~payload_hash:(fun body ->
+      Eio.Executor_pool.submit_exn pool ~weight:1.0 (fun () ->
+        S3.Auth.hex_sha256 body))
+    ()
+```
+
 ### Comparison with s5cmd
 
 Two workloads on a Ceph RGW, ~1.4M-object bucket.
