@@ -594,6 +594,18 @@ let get_to_file t ~bucket ~key ~path =
       end
       else Error (error_of_response resp (read_body rbody)))
 
+let get_range t ~bucket ~key ~first ~last () =
+  if last < first then
+    Error { http_status = 0; code = "Range"; message = "last < first" }
+  else
+    let extra_headers = [ ("range", Printf.sprintf "bytes=%d-%d" first last) ] in
+    (* Cap the read at the requested span plus headroom for Buf_read's growth;
+       a range request returns 206 with exactly the bytes. *)
+    let max_size = (last - first + 1) + (64 * 1024) in
+    call t ~meth:`GET ~bucket ~key ~extra_headers (fun resp rbody ->
+        if is_success resp then Ok (read_body ~max_size rbody)
+        else Error (error_of_response resp (read_body rbody)))
+
 let metadata_of_response resp =
   let headers = Http.Response.headers resp in
   let get name = Http.Header.get headers name in

@@ -181,6 +181,21 @@ val get_string :
 val get_to_file :
   t -> bucket:string -> key:string -> path:_ Eio.Path.t -> (unit, error) result
 
+(** [get_range t ~bucket ~key ~first ~last ()] downloads the inclusive byte
+    range [\[first, last\]] of an object via an HTTP [Range] request, returning
+    just those bytes. The server answers [206 Partial Content]; the result
+    string is [last - first + 1] bytes. Returns [Error] if [last < first].
+    Useful for reading a small slice of a large object without fetching it
+    whole. *)
+val get_range :
+  t ->
+  bucket:string ->
+  key:string ->
+  first:int ->
+  last:int ->
+  unit ->
+  (string, error) result
+
 (** [head_object t ~bucket ~key] fetches object metadata without the body. *)
 val head_object : t -> bucket:string -> key:string -> (metadata, error) result
 
