@@ -376,7 +376,17 @@ let redirect_region t resp =
   if is_success resp then None
   else
     match Http.Header.get (Http.Response.headers resp) "x-amz-bucket-region" with
-    | Some r when r <> "" && not (String.equal r t.region) -> Some r
+    | Some r when r <> "" ->
+        (* A 301/307 region redirect must be followed regardless of [t.region]:
+           under concurrency another fiber may already have retargeted [t.region]
+           to [r] (so [r = t.region] here), but THIS response still came from the
+           old endpoint and must be replayed. [retarget] dedupes via [`Already].
+           For other statuses only follow when the region actually differs, so a
+           plain 4xx (e.g. a 404 for an absent key, which also carries
+           x-amz-bucket-region) is not mistaken for a redirect. *)
+        let code = status_code resp in
+        if code = 301 || code = 307 || not (String.equal r t.region) then Some r
+        else None
     | _ -> None
 
 (* Re-point the client (and its pool) at [new_region]. Idempotent and
@@ -488,9 +498,11 @@ let call t ~meth ~bucket ~key ?(query = []) ?(extra_headers = []) ?(body = "") f
           if connection_should_close resp then Conn_pool.discard t.pool conn
           else Conn_pool.release t.pool conn;
           `Ok result
-      | `Redirect (resp, new_region) ->
-          if connection_should_close resp then Conn_pool.discard t.pool conn
-          else Conn_pool.release t.pool conn;
+      | `Redirect (_resp, new_region) ->
+          (* This connection reached the redirecting (old-region) host; never
+             return it to the idle pool, or a later request could reuse it and
+             be redirected again. *)
+          Conn_pool.discard t.pool conn;
           `Follow new_region
       | `Throttle resp ->
           (* Valid HTTP response, body drained: the connection is reusable. *)
