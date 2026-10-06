@@ -127,6 +127,26 @@ let () =
         | None -> Alcotest.fail "hello.txt not in page objects"
       in
 
+      let test_list_delimiter () =
+        List.iter
+          (fun k -> ignore (or_fail "put" (S3.Client.put_string client ~bucket ~key:k "x")))
+          [ "dir/a.txt"; "dir/sub/b.txt"; "dir/sub/deeper/c.txt"; "dir2/d.txt" ];
+        let page =
+          or_fail "list_page" (S3.Client.list_page client ~bucket ~prefix:"dir/" ~delimiter:"/" ())
+        in
+        Alcotest.(check (list string))
+          "objects at this level" [ "dir/a.txt" ]
+          (List.map (fun (e : S3.Client.entry) -> e.key) page.objects);
+        Alcotest.(check (list string))
+          "rolled-up sub-prefixes" [ "dir/sub/" ] page.common_prefixes;
+        let plain = or_fail "list_page" (S3.Client.list_page client ~bucket ~prefix:"dir/" ()) in
+        Alcotest.(check (list string)) "no delimiter: no prefixes" [] plain.common_prefixes;
+        Alcotest.(check int) "no delimiter: all keys" 3 (List.length plain.objects);
+        List.iter
+          (fun k -> or_fail "delete" (S3.Client.delete_object client ~bucket ~key:k))
+          [ "dir/a.txt"; "dir/sub/b.txt"; "dir/sub/deeper/c.txt"; "dir2/d.txt" ]
+      in
+
       let test_missing_key () =
         match S3.Client.get_string client ~bucket ~key:"does-not-exist" () with
         | Ok _ -> Alcotest.fail "expected error for missing key"
@@ -294,6 +314,7 @@ let () =
                   Alcotest.test_case "put/get string" `Quick test_put_get_string;
                   Alcotest.test_case "head metadata" `Quick test_head_metadata;
                   Alcotest.test_case "list objects" `Quick test_list;
+                  Alcotest.test_case "list with delimiter" `Quick test_list_delimiter;
                   Alcotest.test_case "missing key" `Quick test_missing_key;
                   Alcotest.test_case "delete object" `Quick test_delete;
                   Alcotest.test_case

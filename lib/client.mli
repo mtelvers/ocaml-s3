@@ -264,31 +264,44 @@ type entry = {
 (** A single page of a listing. *)
 type page = {
   objects : entry list;
+  common_prefixes : string list;
+      (** With a [delimiter]: the distinct key prefixes, up to and including
+          the first delimiter after [prefix], of the keys that were rolled up
+          instead of being listed in [objects].  Empty without a delimiter. *)
   next_continuation_token : string option;
       (** Token to pass as [continuation_token] for the next page, or [None]
           when this is the last page. *)
 }
 
-(** [list_page t ~bucket ?prefix ?continuation_token ?max_keys ()] fetches one
-    page of a [ListObjectsV2] listing (the low-level primitive). *)
+(** [list_page t ~bucket ?prefix ?delimiter ?continuation_token ?max_keys ()]
+    fetches one page of a [ListObjectsV2] listing (the low-level primitive).
+
+    With [delimiter] (typically ["/"]) the server groups keys that contain the
+    delimiter after [prefix] into [common_prefixes], one entry per distinct
+    group, and lists only the remaining keys in [objects]: a directory-style
+    listing of one level in a single request, however many keys lie beneath. *)
 val list_page :
   t ->
   bucket:string ->
   ?prefix:string ->
+  ?delimiter:string ->
   ?continuation_token:string ->
   ?max_keys:int ->
   unit ->
   (page, error) result
 
-(** [fold_pages t ~bucket ?prefix ?max_keys_per_page ~init ~f ()] folds [f] over
-    every {e page} under [prefix], following continuation tokens across all
-    pages. Pages are fetched sequentially (each depends on the previous token);
-    folding per page lets callers track page boundaries (e.g. for progress).
-    Stops and returns [Error] on the first failed page. *)
+(** [fold_pages t ~bucket ?prefix ?delimiter ?max_keys_per_page ~init ~f ()]
+    folds [f] over every {e page} under [prefix], following continuation tokens
+    across all pages. Pages are fetched sequentially (each depends on the
+    previous token); folding per page lets callers track page boundaries (e.g.
+    for progress). Stops and returns [Error] on the first failed page.
+    [delimiter] is passed to {!list_page}; the per-object helpers below list
+    without one. *)
 val fold_pages :
   t ->
   bucket:string ->
   ?prefix:string ->
+  ?delimiter:string ->
   ?max_keys_per_page:int ->
   init:'a ->
   f:('a -> page -> 'a) ->

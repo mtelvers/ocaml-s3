@@ -667,6 +667,7 @@ type entry = {
 
 type page = {
   objects : entry list;
+  common_prefixes : string list;
   next_continuation_token : string option;
 }
 
@@ -690,10 +691,11 @@ let entry_of_contents node =
           last_modified = Xml_util.find_text "LastModified" node;
         }
 
-let list_page t ~bucket ?prefix ?continuation_token ?(max_keys = 1000) () =
+let list_page t ~bucket ?prefix ?delimiter ?continuation_token ?(max_keys = 1000) () =
   let query =
     [ ("list-type", "2"); ("max-keys", string_of_int max_keys) ]
     @ (match prefix with Some p -> [ ("prefix", p) ] | None -> [])
+    @ (match delimiter with Some d -> [ ("delimiter", d) ] | None -> [])
     @
     match continuation_token with
     | Some tok -> [ ("continuation-token", tok) ]
@@ -703,11 +705,15 @@ let list_page t ~bucket ?prefix ?continuation_token ?(max_keys = 1000) () =
       let body = read_body ~max_size:list_max_body rbody in
       if is_success resp then
         match Xml_util.parse_string body with
-        | None -> Ok { objects = []; next_continuation_token = None }
+        | None -> Ok { objects = []; common_prefixes = []; next_continuation_token = None }
         | Some tree ->
             let objects =
               Xml_util.find_all "Contents" tree
               |> List.filter_map entry_of_contents
+            in
+            let common_prefixes =
+              Xml_util.find_all "CommonPrefixes" tree
+              |> List.filter_map (Xml_util.find_text "Prefix")
             in
             let truncated =
               match Xml_util.find_text "IsTruncated" tree with
@@ -718,17 +724,17 @@ let list_page t ~bucket ?prefix ?continuation_token ?(max_keys = 1000) () =
               if truncated then Xml_util.find_text "NextContinuationToken" tree
               else None
             in
-            Ok { objects; next_continuation_token }
+            Ok { objects; common_prefixes; next_continuation_token }
       else Error (error_of_response resp body))
 
 (* Fold over every page of a listing, following continuation tokens. This is the
    primitive the per-object helpers build on; folding per page (rather than per
    object) lets callers track page boundaries, e.g. for progress reporting. *)
-let fold_pages t ~bucket ?prefix ?(max_keys_per_page = 1000) ~init ~f () =
+let fold_pages t ~bucket ?prefix ?delimiter ?(max_keys_per_page = 1000) ~init ~f () =
   let rec loop acc continuation_token =
     match
-      list_page t ~bucket ?prefix ?continuation_token ~max_keys:max_keys_per_page
-        ()
+      list_page t ~bucket ?prefix ?delimiter ?continuation_token
+        ~max_keys:max_keys_per_page ()
     with
     | Error _ as e -> e
     | Ok page -> (

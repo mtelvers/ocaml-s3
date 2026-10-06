@@ -17,7 +17,9 @@ built on [Eio](https://github.com/ocaml-multicore/eio) and
 - **Listing.** `ListObjectsV2` with prefix and pagination: `list_page` (one
   page), `fold_pages` (fold over all pages, following continuation tokens),
   `iter_objects`, and `list_objects` (collect all keys). Entries carry
-  `key`, `size`, `etag` and `last_modified`.
+  `key`, `size`, `etag` and `last_modified`. A `delimiter` gives a
+  directory-style listing of one level, with the rolled-up groups in
+  `common_prefixes`.
 - **AWS Signature Version 4.** Every request is signed; the implementation is
   pure and unit-tested against the published AWS test vector.
 - **S3-compatible.** Uses path-style addressing by default, as expected by
