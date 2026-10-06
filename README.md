@@ -8,7 +8,8 @@ built on [Eio](https://github.com/ocaml-multicore/eio) and
 
 - **Large objects.** `put_file` auto-selects between a single `PUT` (small
   files) and a **multipart upload** (large files), sending parts concurrently
-  with Eio fibers. Downloads stream straight to a file. Memory use stays
+  with Eio fibers. `put_flow` does the same for any `Eio.Flow.source` of known
+  size, including an in-memory string via `Eio.Flow.string_source`. Downloads stream straight to a file. Memory use stays
   bounded by the part size × concurrency regardless of object size — a 100 MB
   upload/download round-trip is part of the test suite.
 - **Metadata.** Set user metadata (`x-amz-meta-*`) and content type on upload;

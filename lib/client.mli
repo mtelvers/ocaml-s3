@@ -165,6 +165,31 @@ val put_file :
   unit ->
   (string, error) result
 
+(** [put_flow t ~bucket ~key ~size flow] uploads the [size] bytes that [flow]
+    yields, with the same single-PUT / multipart selection and parameters as
+    {!put_file}: at most [multipart_threshold] bytes go up as one PUT, larger
+    uploads are split into [part_size]-byte parts with up to
+    [max_concurrency] in flight, each part retried independently.  Parts are
+    read from the flow as slots free up, so memory use is bounded by
+    [part_size * max_concurrency] whatever the size.  Returns the ETag.
+
+    [size] must be the number of bytes the flow will yield before
+    end-of-file; it selects the upload mode and checks the part limit.  An
+    in-memory value is uploaded without copying it whole again with
+    [put_flow ... ~size:(String.length s) (Eio.Flow.string_source s)]. *)
+val put_flow :
+  t ->
+  bucket:string ->
+  key:string ->
+  ?content_type:string ->
+  ?metadata:(string * string) list ->
+  ?part_size:int ->
+  ?multipart_threshold:int ->
+  ?max_concurrency:int ->
+  size:int ->
+  _ Eio.Flow.source ->
+  (string, error) result
+
 (** [get_string t ~bucket ~key ()] downloads an object into a string.
     @param max_size cap on the object size accepted, in bytes (default 128 MiB),
       to bound memory use. *)

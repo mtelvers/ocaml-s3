@@ -855,8 +855,11 @@ let too_many_parts_error ~size ~part_size =
         (part_count ~size ~part_size) size part_size max_upload_parts;
   }
 
+(* Multipart upload of the bytes a flow yields.  Parts are read from the flow
+   sequentially, each only once a concurrency slot is free, so at most
+   [max_concurrency] parts are buffered at a time. *)
 let multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
-    ~max_concurrency ~path =
+    ~max_concurrency flow =
   let extra_headers =
     (match content_type with Some ct -> [ ("content-type", ct) ] | None -> [])
     @ meta_headers metadata
@@ -868,35 +871,34 @@ let multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
       let first_error = ref None in
       let mutex = Eio.Mutex.create () in
       let sem = Eio.Semaphore.make max_concurrency in
-      Eio.Path.with_open_in path (fun file ->
-          Eio.Switch.run (fun sw ->
-              let rec loop part_number =
-                if !first_error <> None then ()
-                else begin
-                  Eio.Semaphore.acquire sem;
-                  let chunk = read_chunk file part_size in
-                  if chunk = "" then Eio.Semaphore.release sem
-                  else begin
-                    Eio.Fiber.fork ~sw (fun () ->
-                        Fun.protect
-                          ~finally:(fun () -> Eio.Semaphore.release sem)
-                          (fun () ->
-                            match
-                              upload_part t ~bucket ~key ~upload_id ~part_number
-                                ~body:chunk
-                            with
-                            | Ok etag ->
-                                Eio.Mutex.use_rw ~protect:true mutex (fun () ->
-                                    results := (part_number, etag) :: !results)
-                            | Error e ->
-                                Eio.Mutex.use_rw ~protect:true mutex (fun () ->
-                                    if !first_error = None then
-                                      first_error := Some e)));
-                    loop (part_number + 1)
-                  end
-                end
-              in
-              loop 1));
+      Eio.Switch.run (fun sw ->
+          let rec loop part_number =
+            if !first_error <> None then ()
+            else begin
+              Eio.Semaphore.acquire sem;
+              let chunk = read_chunk flow part_size in
+              if chunk = "" then Eio.Semaphore.release sem
+              else begin
+                Eio.Fiber.fork ~sw (fun () ->
+                    Fun.protect
+                      ~finally:(fun () -> Eio.Semaphore.release sem)
+                      (fun () ->
+                        match
+                          upload_part t ~bucket ~key ~upload_id ~part_number
+                            ~body:chunk
+                        with
+                        | Ok etag ->
+                            Eio.Mutex.use_rw ~protect:true mutex (fun () ->
+                                results := (part_number, etag) :: !results)
+                        | Error e ->
+                            Eio.Mutex.use_rw ~protect:true mutex (fun () ->
+                                if !first_error = None then
+                                  first_error := Some e)));
+                loop (part_number + 1)
+              end
+            end
+          in
+          loop 1);
       (match !first_error with
       | Some e ->
           abort_multipart t ~bucket ~key ~upload_id;
@@ -907,22 +909,27 @@ let multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
           in
           complete_multipart t ~bucket ~key ~upload_id ~parts)
 
-let file_size path =
-  Eio.Path.with_open_in path (fun file ->
-      Optint.Int63.to_int (Eio.File.size file))
-
-let put_file t ~bucket ~key ?content_type ?(metadata = [])
+let put_flow t ~bucket ~key ?content_type ?(metadata = [])
     ?(part_size = 8 * 1024 * 1024) ?(multipart_threshold = 16 * 1024 * 1024)
-    ?(max_concurrency = 4) ~path () =
-  let size = file_size path in
+    ?(max_concurrency = 4) ~size flow =
   if size <= multipart_threshold then
-    let data = Eio.Path.load path in
-    put_string t ~bucket ~key ?content_type ~metadata data
+    put_string t ~bucket ~key ?content_type ~metadata (read_chunk flow size)
   else if part_count ~size ~part_size > max_upload_parts then
     Error (too_many_parts_error ~size ~part_size)
   else
     multipart_put t ~bucket ~key ~content_type ~metadata ~part_size
-      ~max_concurrency ~path
+      ~max_concurrency flow
+
+let file_size path =
+  Eio.Path.with_open_in path (fun file ->
+      Optint.Int63.to_int (Eio.File.size file))
+
+let put_file t ~bucket ~key ?content_type ?metadata ?part_size
+    ?multipart_threshold ?max_concurrency ~path () =
+  let size = file_size path in
+  Eio.Path.with_open_in path (fun file ->
+      put_flow t ~bucket ~key ?content_type ?metadata ?part_size
+        ?multipart_threshold ?max_concurrency ~size file)
 
 (* {1 Server-side copy} *)
 
